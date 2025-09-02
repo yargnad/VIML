@@ -5,7 +5,7 @@ set -e
 PYTHON_VERSION="3.11.9"
 FFMPEG_VERSION="7.0"
 PROJECT_REPO="https://github.com/yargnad/VIML.git" # IMPORTANT: Change this
-PROJECT_DIR="viml_project"
+PROJECT_DIR="VIML"
 BUILD_DIR="$HOME/source_builds"
 
 # --- Helper Functions ---
