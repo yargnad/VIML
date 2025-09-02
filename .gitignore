@@ -1,0 +1,16 @@
+# Virtualenv
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Build artifacts
+source_builds/
+
+# Editor
+.vscode/
+.DS_Store
+
+# Logs and runtime
+*.log
