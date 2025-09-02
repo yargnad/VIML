@@ -128,7 +128,7 @@ if [[ "$ENABLE_NVIDIA" =~ ^[Yy]$ ]]; then
 
         # Clone and attempt to install into LOCAL_PREFIX without sudo.
         if [ ! -d "$BUILD_DIR/nv-codec-headers" ]; then
-            retry "git clone 'https://git.videolan.org/ffmpeg/nv-codec-headers.git' '$BUILD_DIR/nv-codec-headers'" || true
+            retry "git clone 'https://github.com/FFmpeg/nv-codec-headers.git' '$BUILD_DIR/nv-codec-headers'" || true
         fi
 
         if [ -d "$BUILD_DIR/nv-codec-headers" ]; then

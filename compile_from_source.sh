@@ -57,12 +57,72 @@ PACKAGES=(
     tesseract-ocr-eng
     tesseract-ocr-script-latn
     libleptonica-dev
+    # AV1 build helpers and meson/ninja for dav1d
+    meson
+    ninja-build
+    cmake
+    libtool
+    autoconf
+    automake
+    pkg-config
+    # prefer distro AV1 dev packages if available
+    libaom-dev
+    libdav1d-dev
+    libsvtav1-dev
 )
 sudo apt install -y "${PACKAGES[@]}"
 success "Build dependencies installed."
 
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
+
+# Local install prefix for optional source-built libraries (libaom, dav1d, svt-av1)
+LOCAL_PREFIX="$BUILD_DIR/local"
+mkdir -p "$LOCAL_PREFIX"
+export PKG_CONFIG_PATH="$LOCAL_PREFIX/lib/pkgconfig:$LOCAL_PREFIX/share/pkgconfig:${PKG_CONFIG_PATH:-}"
+export PATH="$LOCAL_PREFIX/bin:$PATH"
+
+# --- Network helpers: retry with exponential backoff for wget and git clones
+retry() {
+    # usage: retry <max_attempts> <sleep_base_seconds> -- command args...
+    local max_attempts=${1:-5}; shift
+    local sleep_base=${1:-2}; shift
+    if [ "$#" -eq 0 ]; then
+        echo "retry: no command provided" >&2
+        return 2
+    fi
+    local attempt=1
+    local exit_code=0
+    while [ "${attempt}" -le "${max_attempts}" ]; do
+        "$@" && return 0
+        exit_code=$?
+        local sleep_for=$(( sleep_base ** attempt ))
+        echo "Command failed (exit ${exit_code}). Retrying in ${sleep_for}s (attempt ${attempt}/${max_attempts})..." >&2
+        sleep "${sleep_for}"
+        attempt=$(( attempt + 1 ))
+    done
+    return $exit_code
+}
+
+retry_git_clone() {
+    # usage: retry_git_clone <dest_dir> <git_url1> [git_url2 ...]
+    local dest="$1"; shift
+    local url
+    for url in "$@"; do
+        echo "Trying git clone from: $url"
+        if retry 4 2 git clone --depth 1 "$url" "$dest"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+retry_wget() {
+    # usage: retry_wget <url> <out_file>
+    local url="$1"; local out="$2"
+    retry 4 2 wget -c -O "$out" "$url"
+}
+
 
 # --- 2. Compile Python from Source ---
 info "Compiling Python $PYTHON_VERSION..."
@@ -87,6 +147,78 @@ if [ ! -f "ffmpeg-$FFMPEG_VERSION.tar.bz2" ]; then
 fi
 tar -xf "ffmpeg-$FFMPEG_VERSION.tar.bz2"
 cd "ffmpeg-$FFMPEG_VERSION"
+# Build AV1 libs from source into LOCAL_PREFIX if distro packages weren't available
+cd "$BUILD_DIR"
+if ! pkg-config --exists aom || ! pkg-config --exists dav1d || ! pkg-config --exists svtav1; then
+    info "Building AV1 codec libraries into $LOCAL_PREFIX"
+
+    # libaom
+    if [ ! -d "aom" ]; then
+        git clone https://aomedia.googlesource.com/aom aom || git clone https://aomedia.org/aom.git aom || true
+    fi
+    if [ -d "aom" ]; then
+        cd aom
+        mkdir -p build && cd build
+        cmake -G"Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LOCAL_PREFIX" ..
+        make -j"$(nproc)" && make install
+        cd "$BUILD_DIR"
+    fi
+
+    # dav1d (meson)
+    if [ ! -d "dav1d" ]; then
+        git clone https://code.videolan.org/videolan/dav1d.git dav1d || true
+    fi
+    if [ -d "dav1d" ]; then
+        cd dav1d
+        meson setup build --prefix="$LOCAL_PREFIX" --buildtype=release || true
+        ninja -C build && ninja -C build install || true
+        cd "$BUILD_DIR"
+    fi
+
+    # SVT-AV1: try multiple git mirrors first, then tarball fallbacks
+    if [ ! -d "SVT-AV1" ]; then
+        SVT_DEST="$BUILD_DIR/SVT-AV1"
+        SVT_GIT_URLS=(
+            "https://gitlab.com/AOMediaCodec/SVT-AV1.git"
+            "https://github.com/AOMediaCodec/SVT-AV1.git"
+            "https://github.com/AV1-Codec-SVT/SVT-AV1.git"
+        )
+        if ! retry_git_clone "$SVT_DEST" "${SVT_GIT_URLS[@]}"; then
+            echo "Git clones failed, attempting tarball fallbacks..."
+            SVT_TARBALLS=(
+                "https://gitlab.com/AOMediaCodec/SVT-AV1/-/archive/master/SVT-AV1-master.tar.gz"
+                "https://github.com/AOMediaCodec/SVT-AV1/archive/refs/heads/master.tar.gz"
+            )
+            mkdir -p "$SVT_DEST"
+            for tb in "${SVT_TARBALLS[@]}"; do
+                echo "Trying tarball: $tb"
+                tmpfile="$BUILD_DIR/svtav1.tar.gz"
+                if retry_wget "$tb" "$tmpfile"; then
+                    mkdir -p "$SVT_DEST"
+                    tar -xzf "$tmpfile" -C "$BUILD_DIR"
+                    # move extracted dir to SVT-AV1 if needed
+                    extracted=$(tar -tzf "$tmpfile" | head -1 | cut -f1 -d"/") || true
+                    if [ -d "$BUILD_DIR/$extracted" ]; then
+                        mv "$BUILD_DIR/$extracted" "$SVT_DEST"
+                    fi
+                    rm -f "$tmpfile"
+                    break
+                fi
+            done
+        fi
+    fi
+    if [ -d "SVT-AV1" ]; then
+        cd SVT-AV1
+        mkdir -p build && cd build
+        cmake -G"Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LOCAL_PREFIX" ..
+        make -j"$(nproc)" && make install || true
+        cd "$BUILD_DIR"
+    fi
+fi
+
+# Return to FFmpeg source directory
+cd "ffmpeg-$FFMPEG_VERSION"
+
 # NOTE: The hypothetical '--enable-libtesseract' flag would go here
 ./configure \
     --enable-gpl \
@@ -97,7 +229,12 @@ cd "ffmpeg-$FFMPEG_VERSION"
     --enable-libmp3lame \
     --enable-libopus \
     --enable-nonfree \
-    --enable-libtesseract
+    --enable-libtesseract \
+    --enable-libaom \
+    --enable-libdav1d \
+    --enable-libsvtav1 \
+    --extra-cflags="-I$LOCAL_PREFIX/include" \
+    --extra-ldflags="-L$LOCAL_PREFIX/lib"
 make -j"$(nproc)"
 sudo make install
 # Refresh library cache

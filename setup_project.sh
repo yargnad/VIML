@@ -46,7 +46,13 @@ info "Creating Python virtual environment at '$PYTHON_VENV_DIR'..."
 python3 -m venv "$PYTHON_VENV_DIR"
 
 info "Activating virtual environment and installing Python packages..."
-source "$PYTHON_VENV_DIR/bin/activate"
+if [ -f "$PYTHON_VENV_DIR/bin/activate" ]; then
+    # shellcheck disable=SC1091
+    source "$PYTHON_VENV_DIR/bin/activate"
+else
+    warn "Virtualenv activate script not found at $PYTHON_VENV_DIR/bin/activate. Exiting."
+    exit 1
+fi
 
 # Install PyTorch for CPU first for reliability
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
@@ -63,7 +69,7 @@ success "All Python packages installed successfully."
 PROCESSING_FILE="processing.py"
 if [ -f "$PROCESSING_FILE" ]; then
     info "Configuring Hugging Face API Token..."
-    read -p "Please enter your Hugging Face Access Token: " HF_TOKEN
+    read -r -p "Please enter your Hugging Face Access Token: " HF_TOKEN
     
     # Use sed to replace the placeholder token in processing.py
     # Using '#' as a delimiter to avoid issues with special characters in the token
