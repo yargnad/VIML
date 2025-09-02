@@ -11,7 +11,6 @@ from database import get_db_connection
 
 # --- CONFIGURATION ---
 # IMPORTANT: Replace with your actual Hugging Face token
-HUGGING_FACE_TOKEN = "YOUR_HUGGING_FACE_TOKEN_HERE"
 # Assumes a hypothetical FFmpeg v8 with an integrated 'ocr' filter
 OCR_CROP_AREA = "1920:200:0:880" # w:h:x:y for a 1080p video's lower third
 
@@ -19,8 +18,7 @@ OCR_CROP_AREA = "1920:200:0:880" # w:h:x:y for a 1080p video's lower third
 try:
     diarization_pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
-        use_auth_token=HUGGING_FACE_TOKEN
-    )
+        use_auth_token=os.getenv("HUGGING_FACE_TOKEN"))
 except Exception as e:
     print(f"Could not load pyannote pipeline. Please check your token. Error: {e}")
     diarization_pipeline = None
@@ -174,3 +172,5 @@ def _correlate_and_store(video_filename, ocr_data, face_data, speaker_data):
             )
     conn.commit()
     conn.close()
+
+# Token placeholder: set HUGGING_FACE_TOKEN in the environment, not in source
