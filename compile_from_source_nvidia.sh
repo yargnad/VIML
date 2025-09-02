@@ -8,10 +8,61 @@ PROJECT_REPO="https://github.com/yargnad/VIML.git" # IMPORTANT: Change this
 PROJECT_DIR="VIML"
 BUILD_DIR="$HOME/source_builds"
 
+# Local install prefix (default under BUILD_DIR). Define early so other checks
+# that reference $LOCAL_PREFIX won't accidentally operate on root (empty var).
+LOCAL_PREFIX="${LOCAL_PREFIX:-$BUILD_DIR/local}"
+
+
 # --- Helper Functions ---
 info() { echo -e "\033[1;34m[INFO]\033[0m $1"; }
 success() { echo -e "\033[1;32m[SUCCESS]\033[0m $1"; }
 warn() { echo -e "\033[1;33m[WARNING]\033[0m $1"; }
+
+# Ensure a pkg-config package exists, with optional minimum version.
+# Usage: ensure_pkg <pkg-name> [version]
+ensure_pkg() {
+    local pkg="$1"
+    local ver="$2"
+    local query
+    if [ -n "$ver" ]; then
+        query="$pkg >= $ver"
+    else
+        query="$pkg"
+    fi
+
+    if pkg-config --exists "$query"; then
+        success "$pkg found via pkg-config."
+        return 0
+    fi
+
+    warn "$pkg not found via pkg-config. Attempting auto-discovery under $BUILD_DIR..."
+    FOUND_PKG_DIRS=()
+    while IFS= read -r pc; do
+        pkgdir=$(dirname "$pc")
+        case " ${FOUND_PKG_DIRS[*]} " in
+            *" $pkgdir "*) ;;
+            *) FOUND_PKG_DIRS+=("$pkgdir");;
+        esac
+    done < <(find "$BUILD_DIR" -type f -name '*.pc' 2>/dev/null || true)
+
+    if [ ${#FOUND_PKG_DIRS[@]} -gt 0 ]; then
+        for d in "${FOUND_PKG_DIRS[@]}"; do
+            export PKG_CONFIG_PATH="$d:$PKG_CONFIG_PATH"
+            info "Added pkg-config dir: $d"
+        done
+        info "Retrying pkg-config discovery for $pkg..."
+        if pkg-config --exists "$query"; then
+            success "$pkg found after adding discovered pkg-config dirs."
+            return 0
+        else
+            warn "$pkg still not found after auto-discovery."
+            return 1
+        fi
+    else
+        warn "No .pc files found under $BUILD_DIR to help auto-discover $pkg."
+        return 1
+    fi
+}
 
 # retry a shell command (passed as a single string) with exponential backoff
 # usage: retry "git clone ..."  # will try up to 5 times
@@ -34,6 +85,41 @@ retry() {
     done
     return 1
 }
+
+# Parse simple command-line flags
+SKIP_PKGCHECK=0
+INSTALL_MISSING=0
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --skip-pkgcheck)
+                SKIP_PKGCHECK=1
+                shift
+                ;;
+            --install-missing)
+                INSTALL_MISSING=1
+                shift
+                ;;
+            --help|-h)
+                cat <<EOF
+Usage: $0 [--skip-pkgcheck]
+
+Options:
+  --skip-pkgcheck   Do not run the proactive pkg-config checks before running FFmpeg configure.
+  --help            Show this help message.
+EOF
+                exit 0
+                ;;
+            *)
+                # Unknown flags are ignored; script will prompt interactively for missing info
+                shift
+                ;;
+        esac
+    done
+}
+
+# Parse args early so non-interactive flags apply
+parse_args "$@"
 
 # --- Warning ---
 warn "This script will compile Python and FFmpeg from source." 
@@ -138,12 +224,20 @@ if [[ "$ENABLE_NVIDIA" =~ ^[Yy]$ ]]; then
                 make || true
                 # Try installing into the local prefix; fall back to copying headers.
                 if ! make install PREFIX="$LOCAL_PREFIX" >/dev/null 2>&1; then
-                    mkdir -p "$LOCAL_PREFIX/include"
-                    cp -v include/*.h "$LOCAL_PREFIX/include/" || true
+                    if [ -n "$LOCAL_PREFIX" ] && [[ "$LOCAL_PREFIX" == "$HOME"* ]]; then
+                        mkdir -p "$LOCAL_PREFIX/include"
+                        cp -v include/*.h "$LOCAL_PREFIX/include/" || true
+                    else
+                        warn "LOCAL_PREFIX is unsafe ('$LOCAL_PREFIX'); not copying headers to avoid creating root-level paths."
+                    fi
                 fi
             else
-                mkdir -p "$LOCAL_PREFIX/include"
-                cp -v include/*.h "$LOCAL_PREFIX/include/" || true
+                if [ -n "$LOCAL_PREFIX" ] && [[ "$LOCAL_PREFIX" == "$HOME"* ]]; then
+                    mkdir -p "$LOCAL_PREFIX/include"
+                    cp -v include/*.h "$LOCAL_PREFIX/include/" || true
+                else
+                    warn "LOCAL_PREFIX is unsafe ('$LOCAL_PREFIX'); not copying headers to avoid creating root-level paths."
+                fi
             fi
             popd >/dev/null || true
         else
@@ -158,11 +252,9 @@ if [[ "$ENABLE_NVIDIA" =~ ^[Yy]$ ]]; then
     fi
 fi
 
+# Ensure build directory exists and use previously-defined LOCAL_PREFIX
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
-
-# Use a local install prefix to avoid touching system directories
-LOCAL_PREFIX="$BUILD_DIR/local"
 mkdir -p "$LOCAL_PREFIX"
 
 # Initialize extra flags to point at local prefix (will be appended to by CUDA detection)
@@ -258,6 +350,33 @@ ninja -C build -j"$(nproc)"
 ninja -C build install || true
 cd ..
 
+export PKG_CONFIG_PATH="$LOCAL_PREFIX/lib/pkgconfig:$LOCAL_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+# Ensure dav1d is available for FFmpeg
+if ! ensure_pkg dav1d 0.5.0; then
+    warn "ERROR: dav1d >= 0.5.0 not found. See previous messages for how to make it discoverable to pkg-config."
+    exit 1
+fi
+
+# Verify libvorbis (vorbis) is discoverable; try auto-discovery like for dav1d
+if ! pkg-config --exists "vorbis"; then
+    warn "vorbis not found via pkg-config. Attempting to auto-discover .pc files under $BUILD_DIR..."
+
+    FOUND_PKG_DIRS=()
+    while IFS= read -r pc; do
+        pkgdir=$(dirname "$pc")
+        case " ${FOUND_PKG_DIRS[*]} " in
+            *" $pkgdir "*) ;;
+            *) FOUND_PKG_DIRS+=("$pkgdir");;
+        esac
+    done < <(find "$BUILD_DIR" -type f -name '*.pc' 2>/dev/null || true)
+
+    if ! ensure_pkg vorbis; then
+        warn "ERROR: vorbis not found via pkg-config and auto-discovery failed. Consider: sudo apt install libvorbis-dev"
+        exit 1
+    fi
+fi
+
 # --- 2. Compile Python from Source ---
 info "Compiling Python $PYTHON_VERSION..."
 if [ ! -f "Python-$PYTHON_VERSION.tar.xz" ]; then
@@ -310,6 +429,77 @@ if [[ "$ENABLE_NVIDIA" =~ ^[Yy]$ ]]; then
 fi
 
 # Configure FFmpeg with many codecs and optional NVIDIA support
+if [ "$SKIP_PKGCHECK" -eq 0 ]; then
+    info "Checking for common pkg-config dependencies before running FFmpeg configure..."
+    MISSING=()
+    COMMON_PKGS=(x264 x265 vpx aom svtav1 dav1d opus vorbis)
+    for pkg in "${COMMON_PKGS[@]}"; do
+        if ! ensure_pkg "$pkg"; then
+            MISSING+=("$pkg")
+        fi
+    done
+    if [ ${#MISSING[@]} -gt 0 ]; then
+        warn "The following pkg-config packages appear missing or undiscoverable: ${MISSING[*]}"
+
+        # Mapping from pkg names to apt package names
+        declare -A PKG_TO_APT=(
+            [x264]=libx264-dev
+            [x265]=libx265-dev
+            [vpx]=libvpx-dev
+            [aom]=libaom-dev
+            [svtav1]=libsvtav1-dev
+            [dav1d]=libdav1d-dev
+            [opus]=libopus-dev
+            [vorbis]=libvorbis-dev
+        )
+
+        if [ "$INSTALL_MISSING" -eq 1 ]; then
+            APT_LIST=()
+            for p in "${MISSING[@]}"; do
+                if [ -n "${PKG_TO_APT[$p]:-}" ]; then
+                    APT_LIST+=("${PKG_TO_APT[$p]}")
+                else
+                    warn "No apt mapping known for pkg '$p' — skipping automatic install for this item."
+                fi
+            done
+            if [ ${#APT_LIST[@]} -gt 0 ]; then
+                info "Attempting to install missing apt packages: ${APT_LIST[*]}"
+                echo "This will run: sudo apt update && sudo apt install -y ${APT_LIST[*]}"
+                read -r -p "Proceed with apt install? [y/N]: " _ans
+                if [[ "${_ans}" =~ ^[Yy]$ ]]; then
+                    sudo apt update && sudo apt install -y "${APT_LIST[@]}"
+                    info "Retrying pkg-config checks after apt install..."
+                    STILL_MISSING=()
+                    for pkg in "${MISSING[@]}"; do
+                        if ! ensure_pkg "$pkg"; then
+                            STILL_MISSING+=("$pkg")
+                        fi
+                    done
+                    if [ ${#STILL_MISSING[@]} -gt 0 ]; then
+                        warn "Some packages are still not discoverable after installation: ${STILL_MISSING[*]}"
+                        warn "Please check installation or set PKG_CONFIG_PATH appropriately."
+                        exit 1
+                    else
+                        success "All missing packages resolved after apt install."
+                    fi
+                else
+                    warn "User declined to install apt packages. Exiting to allow manual fix."
+                    exit 1
+                fi
+            else
+                warn "No apt package candidates to install for missing pkgs: ${MISSING[*]}"
+                warn "Please install the required -dev packages or ensure their .pc files are discoverable via PKG_CONFIG_PATH."
+                exit 1
+            fi
+        else
+            warn "Install missing packages automatically by running this script with --install-missing or install them manually (e.g., sudo apt install libx264-dev ...)."
+            exit 1
+        fi
+    fi
+else
+    info "Skipping proactive pkg-config checks because --skip-pkgcheck was provided."
+fi
+
 ./configure \
     --enable-gpl \
     --enable-libx264 \
