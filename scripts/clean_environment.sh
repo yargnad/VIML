@@ -1,6 +1,254 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# scripts/clean_environment.sh
+# Safe cleanup helper for developer machines.
+# Removes project venvs and build artifacts under HOME and optionally system-wide installs
+# Usage: ./scripts/clean_environment.sh [--yes] [--dry-run] [--system] [--remove-python] [--escalate] [--project DIR] [--build DIR]
+
+DRY_RUN=0
+AUTO_YES=0
+SYSTEM_CLEAN=0
+REMOVE_PYTHON=0
+ESCALATE=0
+PROJECT_DIR="${HOME}/VIML"
+BUILD_DIR="${HOME}/source_builds"
+
+# Logging setup: timestamped logfile under the project
+LOG_DIR="${PROJECT_DIR}/.cleanup_logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/clean_env_$(date +%Y%m%d_%H%M%S).log"
+
+log() {
+  printf "%s %s\n" "$(date +'%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"
+}
+
+usage() {
+  cat <<EOF
+Usage: $0 [--yes] [--dry-run] [--system] [--remove-python] [--escalate] [--project DIR] [--build DIR]
+
+Options:
+  --yes        Don't prompt, proceed with destructive actions where safe.
+  --dry-run    Show what would be removed but don't delete anything.
+  --system     Also attempt to remove system-wide installs under /usr/local (requires sudo).
+  --remove-python  Also remove Python altinstall artifacts (e.g., python3.11) from /usr/local (requires sudo).
+  --escalate   If removals fail, automatically try safe escalation (sudo chattr/chown) and retry removal.
+  --project    Project root (default: ${HOME}/VIML)
+  --build      Build directory to clean (default: ${HOME}/source_builds)
+EOF
+  exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --yes) AUTO_YES=1; shift ;;
+    --system) SYSTEM_CLEAN=1; shift ;;
+    --remove-python) REMOVE_PYTHON=1; shift ;;
+    --escalate) ESCALATE=1; shift ;;
+    --project) PROJECT_DIR="$2"; shift 2 ;;
+    --build) BUILD_DIR="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    *) echo "Unknown arg: $1"; usage ;;
+  esac
+done
+
+is_under_home() {
+  local p
+  p="$(realpath -s "$1")"
+  case "${p}" in
+    "${HOME}"/*) return 0 ;;
+    "${HOME}") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if ! is_under_home "$PROJECT_DIR"; then
+  echo "Refusing to operate on project dir outside HOME: $PROJECT_DIR"
+  exit 2
+fi
+if ! is_under_home "$BUILD_DIR"; then
+  echo "Refusing to operate on build dir outside HOME: $BUILD_DIR"
+  exit 2
+fi
+
+log "Project: $PROJECT_DIR"
+log "Build dir: $BUILD_DIR"
+
+# Items planned for removal (user-owned, under HOME)
+declare -a TO_REMOVE
+TO_REMOVE+=(
+  "$PROJECT_DIR/venv"
+  "$PROJECT_DIR/.venv"
+  "$PROJECT_DIR/uploads"
+  "$PROJECT_DIR/generated"
+  "$HOME/source_builds"
+  "$HOME/.cache/pip"
+  "$HOME/.cache/torch"
+  "$HOME/.cache/huggingface"
+  "$HOME/.cache/viml_build"
+)
+
+log "Planned destructive actions (safe):"
+for p in "${TO_REMOVE[@]}"; do
+  if [ -e "$p" ]; then
+    du -sh "$p" 2>/dev/null | tee -a "$LOG_FILE" || true
+    log "  -> $p"
+  else
+    log "  (not present) $p"
+  fi
+done
+
+if [ $DRY_RUN -eq 1 ]; then
+  log "Dry-run enabled: no changes will be made. Exiting."
+  log "Log file created: $LOG_FILE"
+  exit 0
+fi
+
+confirm() {
+  if [ $AUTO_YES -eq 1 ]; then
+    return 0
+  fi
+  read -r -p "$1 [y/N]: " ans
+  case "${ans}" in
+    [yY]|[yY][eE][sS]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Track failed removal targets to diagnose/escalate
+FAILED=()
+
+# 1) Remove project venvs and generated dirs (no sudo)
+if confirm "Remove project venvs and generated/upload dirs?"; then
+  for p in "${TO_REMOVE[@]}"; do
+    if [ -e "$p" ]; then
+      log "Removing $p"
+      if rm -rf "$p" 2>&1 | tee -a "$LOG_FILE"; then
+        log "Removed $p"
+      else
+        log "Failed to remove $p (will continue)"
+        FAILED+=("$p")
+      fi
+    fi
+  done
+else
+  log "Skipping project cleanup"
+fi
+
+# 2) Remove user-owned items inside build dir (no sudo)
+if [ -d "$BUILD_DIR" ]; then
+  if confirm "Remove user-owned items under $BUILD_DIR? (safe, no sudo)"; then
+    log "Finding and removing user-owned items under $BUILD_DIR (depth 3)"
+    find "$BUILD_DIR" -maxdepth 3 -user "$USER" -print | tee -a "$LOG_FILE" || true
+    while IFS= read -r p; do
+      log "Removing: $p"
+      if rm -rf "$p" 2>&1 | tee -a "$LOG_FILE"; then
+        log "Removed: $p"
+      else
+        log "Failed to remove: $p"
+        FAILED+=("$p")
+      fi
+    done < <(find "$BUILD_DIR" -maxdepth 3 -user "$USER" -print)
+    log "Done removing user-owned items."
+  else
+    echo "Skipping user-owned removals under $BUILD_DIR"
+  fi
+fi
+
+# If any removals failed, collect diagnostics and optionally escalate
+if [ "${#FAILED[@]}" -gt 0 ]; then
+  log "Some removals failed. Collecting diagnostics for failed paths."
+  for f in "${FAILED[@]}"; do
+    log "Failed item: $f"
+    if [ -e "$f" ]; then
+      log "-- stat --"
+      stat -c '%n: %U %G %A %a' "$f" 2>&1 | tee -a "$LOG_FILE" || true
+      log "-- lsattr --"
+      lsattr -d "$f" 2>&1 | tee -a "$LOG_FILE" || true
+      log "-- getfacl --"
+      getfacl "$f" 2>&1 | tee -a "$LOG_FILE" || true
+    else
+      log "(item no longer exists) $f"
+    fi
+  done
+
+  if [ "$ESCALATE" -eq 1 ] || confirm "Attempt escalation (sudo chattr/chown and retry removal) for the failed items?"; then
+    log "Escalation authorized. Running safe escalation steps for failed items."
+    for f in "${FAILED[@]}"; do
+      # only escalate for items under HOME (safety)
+      if ! is_under_home "$f"; then
+        log "Skipping escalation for $f (outside HOME)"
+        continue
+      fi
+      log "Clearing immutable flag (if present) on $f"
+      sudo chattr -R -i "$f" 2>&1 | tee -a "$LOG_FILE" || true
+      log "Re-owning to current user: $f"
+      sudo chown -R "$(id -u):$(id -g)" "$f" 2>&1 | tee -a "$LOG_FILE" || true
+      log "Removing $f with sudo"
+      sudo rm -rf -- "$f" 2>&1 | tee -a "$LOG_FILE" || true
+      log "Escalation attempt finished for $f"
+    done
+  else
+    log "User declined escalation. Failed items remain; inspect the diagnostics above." 
+  fi
+fi
+
+# 3) Optional system-wide cleanup (/usr/local) - only if requested
+if [ $SYSTEM_CLEAN -eq 1 ]; then
+  log "System cleanup requested. This will require sudo."
+  if confirm "Attempt to remove system-wide installs in /usr/local (ffmpeg, SVT-AV1 libs)?"; then
+    if [ $DRY_RUN -eq 1 ]; then
+      log "(dry-run) Would remove: /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /usr/local/lib/libSvtAv1Enc.so*"
+    else
+      log "Removing /usr/local/bin/ffmpeg and /usr/local/bin/ffprobe if present"
+      sudo rm -fv /usr/local/bin/ffmpeg /usr/local/bin/ffprobe || true
+      log "Removing SVT-AV1 libs from /usr/local/lib if present"
+      sudo rm -fv /usr/local/lib/libSvtAv1Enc.so* || true
+      # Remove ld.so conf if we created one
+      if [ -f /etc/ld.so.conf.d/source_builds_local.conf ]; then
+        log "Removing /etc/ld.so.conf.d/source_builds_local.conf"
+        sudo rm -f /etc/ld.so.conf.d/source_builds_local.conf || true
+      fi
+      log "Refreshing loader cache"
+      sudo ldconfig || true
+    fi
+  else
+    log "Skipped system-wide cleanup as per user choice."
+  fi
+fi
+
+# 4) Optional Python altinstall removal (/usr/local) - only if requested
+if [ $REMOVE_PYTHON -eq 1 ]; then
+  log "Python altinstall removal requested. This will require sudo."
+  if confirm "Remove Python 3.11 altinstall files from /usr/local?"; then
+    if [ $DRY_RUN -eq 1 ]; then
+      log "(dry-run) Would remove python3.11 binaries and libs from /usr/local"
+    else
+      log "Removing python3.11 artifacts from /usr/local (if present)"
+      sudo rm -fv /usr/local/bin/python3.11* /usr/local/bin/pip3.11* || true
+      sudo rm -rfv /usr/local/lib/python3.11 /usr/local/include/python3.11 /usr/local/share/man/man1/python3.11* || true
+    fi
+  else
+    log "Skipped Python altinstall removal as per user choice."
+  fi
+fi
+
+# Final summary
+log ""
+log "Final state check:"
+if [ -d "$BUILD_DIR" ]; then
+  log "$BUILD_DIR exists:"
+  find "$BUILD_DIR" -maxdepth 1 -ls | tee -a "$LOG_FILE" || true
+else
+  log "$BUILD_DIR removed or not present"
+fi
+
+log "Cleanup finished. Log file saved: $LOG_FILE"
+exit 0
+#!/usr/bin/env bash
+set -euo pipefail
+
 # Safe environment cleanup script
 # Removes common local build and venv artefacts under $HOME
 # Logs actions to ~/.cleanup_logs/clean_env_YYYYMMDD_HHMMSS.log
@@ -167,6 +415,8 @@ set -euo pipefail
 
 DRY_RUN=0
 AUTO_YES=0
+SYSTEM_CLEAN=0
+REMOVE_PYTHON=0
 PROJECT_DIR="${HOME}/VIML"
 BUILD_DIR="${HOME}/source_builds"
 
@@ -192,7 +442,6 @@ Options:
 EOF
   exit 1
 }
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
@@ -215,6 +464,10 @@ is_under_home() {
   esac
 }
 
+  if [ "$SYSTEM_CLEAN" -eq 1 ]; then
+    log "System cleanup requested. This will require sudo."
+    # Add system cleanup logic here
+  fi
 if ! is_under_home "$PROJECT_DIR"; then
   echo "Refusing to operate on project dir outside HOME: $PROJECT_DIR"
   exit 2

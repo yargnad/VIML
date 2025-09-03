@@ -56,10 +56,39 @@ ensure_pkg() {
             return 0
         else
             warn "$pkg still not found after auto-discovery."
+            # If pkg-config still fails, try a header-based fallback for
+            # packages that install headers but do not provide a .pc file.
+            # Some distro -dev packages (for example libsvtav1-dev) ship only
+            # headers under /usr/include and no pkg-config metadata.
+            declare -A HEADER_FALLBACKS=(
+                [svtav1]="svt-av1/EbSvtAv1Enc.h"
+            )
+            if [ -n "${HEADER_FALLBACKS[$pkg]:-}" ]; then
+                hdr="${HEADER_FALLBACKS[$pkg]}"
+                for incp in /usr/include /usr/local/include "$LOCAL_PREFIX/include"; do
+                    if [ -f "$incp/$hdr" ]; then
+                        success "$pkg appears available (header found at $incp/$hdr). Treating as present."
+                        return 0
+                    fi
+                done
+            fi
             return 1
         fi
     else
         warn "No .pc files found under $BUILD_DIR to help auto-discover $pkg."
+        # Try header fallback when no .pc files are found
+        declare -A HEADER_FALLBACKS=(
+            [svtav1]="svt-av1/EbSvtAv1Enc.h"
+        )
+        if [ -n "${HEADER_FALLBACKS[$pkg]:-}" ]; then
+            hdr="${HEADER_FALLBACKS[$pkg]}"
+            for incp in /usr/include /usr/local/include "$LOCAL_PREFIX/include"; do
+                if [ -f "$incp/$hdr" ]; then
+                    success "$pkg appears available (header found at $incp/$hdr). Treating as present."
+                    return 0
+                fi
+            done
+        fi
         return 1
     fi
 }
@@ -83,6 +112,38 @@ retry() {
         fi
         attempt=$((attempt + 1))
     done
+    return 1
+}
+
+# Build SVT-AV1 from GitHub into LOCAL_PREFIX as a fallback when pkg-config discovery fails
+build_svt_from_github() {
+    info "Attempting to build SVT-AV1 from GitHub into $LOCAL_PREFIX"
+    mkdir -p "$BUILD_DIR"
+    pushd "$BUILD_DIR" >/dev/null || return 1
+    local svt_dir="SVT-AV1"
+    if [ -d "$svt_dir" ]; then
+        info "SVT-AV1 directory already exists at $BUILD_DIR/$svt_dir, pulling latest"
+        (cd "$svt_dir" && git fetch --all --tags) || true
+    else
+        if ! retry "git clone 'https://github.com/AOMediaCodec/SVT-AV1.git' '$svt_dir'" 3; then
+            warn "Failed to clone SVT-AV1 from GitHub"
+            popd >/dev/null || true
+            return 1
+        fi
+    fi
+    if [ -d "$svt_dir" ]; then
+        cd "$svt_dir"
+        mkdir -p build
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LOCAL_PREFIX"
+        cmake --build build -j"$(nproc)" || true
+        cmake --install build || true
+        popd >/dev/null || true
+        # Update PKG_CONFIG_PATH so subsequent pkg-config checks can find the .pc
+        export PKG_CONFIG_PATH="$LOCAL_PREFIX/lib/pkgconfig:$LOCAL_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+        success "Attempted SVT-AV1 build/install into $LOCAL_PREFIX"
+        return 0
+    fi
+    popd >/dev/null || true
     return 1
 }
 
@@ -183,7 +244,10 @@ if [[ "$ENABLE_NVIDIA" =~ ^[Yy]$ ]]; then
     # Use distro-provided NVENC headers and FFmpeg NVENC helper package where available.
     # On Ubuntu/Debian these are provided by 'nv-codec-headers' and 'libffmpeg-nvenc-dev'.
     # Some systems may require installing NVIDIA's CUDA toolkit/driver from NVIDIA directly.
-    PACKAGES=(
+    # Append NVIDIA-related packages to the existing PACKAGES array so we don't
+    # lose the core build dependencies (e.g., libvorbis-dev) when NVIDIA support
+    # is enabled.
+    PACKAGES+=(
         nvidia-cuda-toolkit
         libffmpeg-nvenc-dev
     )
@@ -286,6 +350,7 @@ if [ ! -d "SVT-AV1" ]; then
     info "Cloning SVT-AV1 (trying known mirrors)..."
     SVT_DIR="SVT-AV1"
     SVT_URLS=(
+        "https://github.com/AOMediaCodec/SVT-AV1.git"
         "https://gitlab.com/AOMediaCodec/SVT-AV1.git"
     )
     CLONED=0
@@ -321,7 +386,12 @@ if [ ! -d "SVT-AV1" ]; then
     fi
 
     if [ $CLONED -ne 1 ]; then
-        warn "Could not obtain SVT-AV1 from known mirrors or tarballs. Please clone or download it manually into $BUILD_DIR/SVT-AV1."
+        warn "Could not obtain SVT-AV1 from known mirrors or tarballs. Attempting to build from GitHub as a last resort."
+        if build_svt_from_github; then
+            CLONED=1
+        else
+            warn "Automatic GitHub build of SVT-AV1 failed. Please clone or download it manually into $BUILD_DIR/SVT-AV1."
+        fi
     fi
 fi
 
@@ -332,6 +402,32 @@ if [ -d "SVT-AV1" ]; then
     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$LOCAL_PREFIX"
     cmake --build build -j"$(nproc)"
     cmake --install build || true
+    # Ensure the installed SVT-AV1 shared libraries are discoverable at runtime.
+    # Prefer installing into /usr/local so the system loader finds them automatically.
+            if ls "$LOCAL_PREFIX/lib"/libSvtAv1Enc.so* >/dev/null 2>&1; then
+        info "SVT-AV1 libraries installed into $LOCAL_PREFIX/lib"
+        # If the system linker already knows about a matching soname, nothing to do.
+        if ldconfig -p | grep -q "libSvtAv1Enc.so"; then
+            info "libSvtAv1Enc already available to system linker."
+        else
+            # If we can run sudo non-interactively, install into /usr/local.
+            if sudo -n true 2>/dev/null; then
+                info "Installing SVT-AV1 into /usr/local so ffmpeg can load it at runtime..."
+                # Try using cmake install to /usr/local; fall back to copying files.
+                if ! sudo cmake --install build --prefix /usr/local >/dev/null 2>&1; then
+                    info "cmake --install to /usr/local failed; copying libraries to /usr/local/lib as fallback."
+                    sudo install -v -m 0755 "$LOCAL_PREFIX/lib"/libSvtAv1Enc.so* /usr/local/lib/ || true
+                fi
+                sudo ldconfig || true
+            else
+                # No sudo: add rpath so the ffmpeg binary can find the local libs without ldconfig.
+                warn "sudo not available: will embed rpath in FFmpeg build so it can find $LOCAL_PREFIX/lib at runtime."
+                EXTRA_LDFLAGS="$EXTRA_LDFLAGS -Wl,-rpath,$LOCAL_PREFIX/lib"
+            fi
+        fi
+    else
+        warn "SVT-AV1 build completed but no libSvtAv1Enc.* files found in $LOCAL_PREFIX/lib"
+    fi
     cd ..
 else
     warn "SVT-AV1 directory missing; skipping SVT-AV1 build."
@@ -441,6 +537,22 @@ if [ "$SKIP_PKGCHECK" -eq 0 ]; then
     if [ ${#MISSING[@]} -gt 0 ]; then
         warn "The following pkg-config packages appear missing or undiscoverable: ${MISSING[*]}"
 
+        # If svtav1 is missing, try to build SVT-AV1 from GitHub into the local prefix
+        for idx in "${!MISSING[@]}"; do
+            if [ "${MISSING[$idx]}" = "svtav1" ]; then
+                warn "svtav1 missing: attempting to build SVT-AV1 from source into $LOCAL_PREFIX as a fallback."
+                if build_svt_from_github; then
+                    info "SVT-AV1 built into $LOCAL_PREFIX; retrying pkg-config discovery."
+                    # retry discovery
+                    if ensure_pkg svtav1; then
+                        unset 'MISSING[$idx]'
+                    fi
+                else
+                    warn "Automated SVT-AV1 build failed; proceeding with normal install flow." 
+                fi
+            fi
+        done
+
         # Mapping from pkg names to apt package names
         declare -A PKG_TO_APT=(
             [x264]=libx264-dev
@@ -467,8 +579,41 @@ if [ "$SKIP_PKGCHECK" -eq 0 ]; then
                 echo "This will run: sudo apt update && sudo apt install -y ${APT_LIST[*]}"
                 read -r -p "Proceed with apt install? [y/N]: " _ans
                 if [[ "${_ans}" =~ ^[Yy]$ ]]; then
-                    sudo apt update && sudo apt install -y "${APT_LIST[@]}"
-                    info "Retrying pkg-config checks after apt install..."
+                    if ! sudo apt update || ! sudo apt install -y "${APT_LIST[@]}"; then
+                        warn "apt install failed for some packages. Will attempt special-case fallbacks where possible."
+                        # Special-case: if libvorbis-dev was requested, try to download from Launchpad (Ubuntu noble)
+                        for p in "${APT_LIST[@]}"; do
+                            if [ "$p" = "libvorbis-dev" ]; then
+                                warn "Attempting fallback: download libvorbis-dev .deb from Launchpad (Ubuntu noble)"
+                                tmpdir=$(mktemp -d)
+                                page="$tmpdir/page.html"
+                                deb="$tmpdir/libvorbis-dev.deb"
+                                if wget -q -O "$page" "https://launchpad.net/ubuntu/noble/+package/libvorbis-dev"; then
+                                    # Grep for .deb links (arm/amd64) and pick the first amd64 one if available
+                                    deb_url=$(grep -oE "https?://[^\"']+\\.deb" "$page" | grep amd64 | head -n 1 || true)
+                                    if [ -z "$deb_url" ]; then
+                                        deb_url=$(grep -oE "https?://[^\"']+\\.deb" "$page" | head -n 1 || true)
+                                    fi
+                                    if [ -n "$deb_url" ]; then
+                                        info "Found .deb URL: $deb_url"
+                                        if wget -q -O "$deb" "$deb_url"; then
+                                            info "Installing downloaded .deb: $deb"
+                                            sudo dpkg -i "$deb" || true
+                                            sudo apt-get -f install -y || true
+                                        else
+                                            warn "Failed to download .deb from $deb_url"
+                                        fi
+                                    else
+                                        warn "Could not find a .deb link on Launchpad page for libvorbis-dev."
+                                    fi
+                                else
+                                    warn "Failed to fetch Launchpad page; cannot auto-download .deb."
+                                fi
+                                rm -rf "$tmpdir" || true
+                            fi
+                        done
+                    fi
+                    info "Retrying pkg-config checks after apt install/fallbacks..."
                     STILL_MISSING=()
                     for pkg in "${MISSING[@]}"; do
                         if ! ensure_pkg "$pkg"; then
@@ -476,11 +621,11 @@ if [ "$SKIP_PKGCHECK" -eq 0 ]; then
                         fi
                     done
                     if [ ${#STILL_MISSING[@]} -gt 0 ]; then
-                        warn "Some packages are still not discoverable after installation: ${STILL_MISSING[*]}"
+                        warn "Some packages are still not discoverable after installation or fallbacks: ${STILL_MISSING[*]}"
                         warn "Please check installation or set PKG_CONFIG_PATH appropriately."
                         exit 1
                     else
-                        success "All missing packages resolved after apt install."
+                        success "All missing packages resolved after apt install/fallbacks."
                     fi
                 else
                     warn "User declined to install apt packages. Exiting to allow manual fix."
@@ -519,6 +664,40 @@ fi
     "${NV_FLAGS[@]}" \
     --extra-cflags="$EXTRA_CFLAGS" \
     --extra-ldflags="$EXTRA_LDFLAGS"
+
+# Some SVT-AV1 releases changed the svt_av1_enc_init_handle signature (reordered/removed
+# a parameter). FFmpeg versions that expect the old 3-arg call will fail to compile.
+# Apply a local, idempotent patch to the FFmpeg source to call the API that matches the
+# installed SVT-AV1 headers when needed. This is safe because it only replaces the
+# exact old call site and leaves other code untouched.
+if [ -f "libavcodec/libsvtav1.c" ]; then
+    if grep -q "svt_av1_enc_init_handle(&svt_enc->svt_handle, svt_enc, &svt_enc->enc_params)" libavcodec/libsvtav1.c; then
+        info "Patching libavcodec/libsvtav1.c to match installed SVT-AV1 API (robust replace)..."
+        # Create a backup if one doesn't already exist
+        if [ ! -f libavcodec/libsvtav1.c.svtapi.bak ]; then
+            cp -v libavcodec/libsvtav1.c libavcodec/libsvtav1.c.svtapi.bak || true
+        fi
+        tmpf=$(mktemp)
+        # Try a robust perl-based replace of the first matching svt_av1_enc_init_handle call.
+        # This replaces the first occurrence only and writes to a temporary file.
+        perl -0777 -pe 's/\bsvt_ret\s*=\s*svt_av1_enc_init_handle\([^;]*?svt_enc[^;]*?enc_params\);/svt_ret = svt_av1_enc_init_handle(&svt_enc->svt_handle, &svt_enc->enc_params);/s' libavcodec/libsvtav1.c > "$tmpf" || true
+        # Validate the temp file contains the expected corrected call before replacing the original.
+        if [ -f "$tmpf" ] && grep -q "svt_av1_enc_init_handle(&svt_enc->svt_handle, &svt_enc->enc_params)" "$tmpf"; then
+            mv -f "$tmpf" libavcodec/libsvtav1.c
+            info "Patched libavcodec/libsvtav1.c successfully (perl)."
+        else
+            warn "Automated perl patch failed or did not produce expected output. Restoring from backup and leaving source unchanged."
+            rm -f "$tmpf" || true
+            if [ -f libavcodec/libsvtav1.c.svtapi.bak ]; then
+                cp -v libavcodec/libsvtav1.c.svtapi.bak libavcodec/libsvtav1.c || true
+            fi
+        fi
+    else
+        info "No SVT-AV1 API patch necessary (call site absent or already patched)."
+    fi
+else
+    warn "FFmpeg source libavcodec/libsvtav1.c not found; cannot apply SVT-AV1 API patch."
+fi
 
 make -j"$(nproc)"
 sudo make install
