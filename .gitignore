@@ -14,3 +14,9 @@ source_builds/
 
 # Logs and runtime
 *.log
+
+# VIML Runtime
+uploads/
+generated/
+*.db
+*.wav
