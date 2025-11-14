@@ -2,7 +2,8 @@
 import os
 import uuid
 import threading
-from flask import Flask, request, jsonify, send_file
+import subprocess
+from flask import Flask, request, jsonify, send_file, after_this_request
 from werkzeug.utils import secure_filename
 
 from database import init_db, get_db_connection
