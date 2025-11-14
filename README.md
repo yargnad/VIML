@@ -168,8 +168,12 @@ curl "http://localhost:5000/v1/videos/broadcast.mp4/download" -o output.mp4
 
 ## Documentation
 
+- **[Quick Start Guide](QUICKSTART.md)**: 5-minute tutorial to get started
 - **[VIML Specification](VIML_SPECIFICATION.md)**: Complete technical specification
+- **[Examples & Use Cases](EXAMPLES.md)**: Real-world examples and integrations
 - **[Project Opinion](PROJECT_OPINION.md)**: Analysis and strategic assessment
+- **[Roadmap](ROADMAP.md)**: Project roadmap and future plans
+- **[Contributing](CONTRIBUTING.md)**: How to contribute to the project
 - **[Database Schema](database.py)**: Schema documentation
 - **[API Reference](app.py)**: REST API endpoints
 
