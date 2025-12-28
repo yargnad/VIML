@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="space-y-6">
+    <!-- Stats Row -->
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div class="bg-gray-800 p-4 rounded-lg border border-gray-700">
+            <div class="text-xs text-gray-400 uppercase">Total Videos</div>
+            <div id="stat-videos" class="text-2xl font-bold text-white">-</div>
+        </div>
+        <div class="bg-gray-800 p-4 rounded-lg border border-gray-700">
+            <div class="text-xs text-gray-400 uppercase">Total People</div>
+            <div id="stat-people" class="text-2xl font-bold text-white">-</div>
+        </div>
+        <div class="bg-gray-800 p-4 rounded-lg border border-gray-700">
+            <div class="text-xs text-gray-400 uppercase">Hosts Detected</div>
+            <div id="stat-hosts" class="text-2xl font-bold text-green-400">-</div>
+        </div>
+        <div class="bg-gray-800 p-4 rounded-lg border border-gray-700">
+            <div class="text-xs text-gray-400 uppercase">Guests Detected</div>
+            <div id="stat-guests" class="text-2xl font-bold text-blue-400">-</div>
+        </div>
+    </div>
+
+    <!-- Charts Row -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <!-- Top People Chart -->
+        <div class="bg-gray-800 p-4 rounded-lg border border-gray-700">
+            <h3 class="text-sm font-bold text-gray-300 mb-4">Top 5 Appearances</h3>
+            <canvas id="topPeopleChart"></canvas>
+        </div>
+
+        <!-- Role Dist Chart -->
+        <div class="bg-gray-800 p-4 rounded-lg border border-gray-700">
+            <h3 class="text-sm font-bold text-gray-300 mb-4">Host vs Guest Distribution</h3>
+            <div class="h-64 flex justify-center">
+                <canvas id="roleChart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- Network Graph -->
+    <div class="bg-gray-800 p-4 rounded-lg border border-gray-700">
+        <h3 class="text-sm font-bold text-gray-300 mb-4">Co-Occurrence Knowledge Graph</h3>
+        <p class="text-xs text-gray-400 mb-2">People linked if they appear in the same video.</p>
+        <div id="network-graph" class="w-full h-[500px] bg-gray-900 rounded border border-gray-700"></div>
+    </div>
+</div>
+
+<!-- Scripts -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+
+<script>
+    async function loadStats() {
+        const res = await fetch('/v1/analytics/stats');
+        const data = await res.json();
+
+        document.getElementById('stat-videos').innerText = data.total_videos;
+        document.getElementById('stat-people').innerText = data.total_people;
+        document.getElementById('stat-hosts').innerText = data.hosts;
+        document.getElementById('stat-guests').innerText = data.guests;
+
+        // Top People Bar Chart
+        const ctxPeople = document.getElementById('topPeopleChart').getContext('2d');
+        new Chart(ctxPeople, {
+            type: 'bar',
+            data: {
+                labels: data.top_people.map(p => p.name),
+                datasets: [{
+                    label: 'Appearances',
+                    data: data.top_people.map(p => p.appearances),
+                    backgroundColor: 'rgba(59, 130, 246, 0.5)',
+                    borderColor: 'rgb(59, 130, 246)',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                scales: { y: { beginAtZero: true } },
+                plugins: { legend: { display: false } }
+            }
+        });
+
+        // Role Pie Chart
+        const ctxRole = document.getElementById('roleChart').getContext('2d');
+        new Chart(ctxRole, {
+            type: 'doughnut',
+            data: {
+                labels: ['Hosts', 'Guests'],
+                datasets: [{
+                    data: [data.hosts, data.guests],
+                    backgroundColor: ['rgba(34, 197, 94, 0.6)', 'rgba(59, 130, 246, 0.6)'],
+                    borderWidth: 0
+                }]
+            }
+        });
+    }
+
+    async function loadGraph() {
+        const res = await fetch('/v1/analytics/network');
+        const data = await res.json();
+
+        // Transform for Vis.js
+        const nodes = new vis.DataSet(data.nodes.map(n => ({
+            id: n.id,
+            label: n.name,
+            group: n.role, // 'host' or 'guest'
+            title: n.title || n.role
+        })));
+
+        const edges = new vis.DataSet(data.edges);
+
+        const container = document.getElementById('network-graph');
+        const options = {
+            nodes: {
+                shape: 'dot',
+                size: 16,
+                font: { color: '#e5e7eb' },
+                borderWidth: 2
+            },
+            groups: {
+                host: { color: { background: '#22c55e', border: '#16a34a' } },
+                guest: { color: { background: '#3b82f6', border: '#2563eb' } },
+                Unknown: { color: { background: '#9ca3af', border: '#6b7280' } }
+            },
+            physics: {
+                stabilization: false,
+                barnesHut: { gravitationalConstant: -2000 }
+            }
+        };
+        new vis.Network(container, { nodes, edges }, options);
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        loadStats();
+        loadGraph();
+    });
+</script>
+{% endblock %}

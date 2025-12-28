@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto">
+    <div class="text-center mb-12">
+        <h2 class="text-3xl font-bold mb-4">Knowledge Base</h2>
+        <p class="text-gray-400">Search across all processed video intelligence</p>
+    </div>
+
+    <!-- Search Bar -->
+    <div class="relative mb-12">
+        <input type="text" id="search-input"
+            class="w-full bg-gray-800 border border-gray-700 rounded-2xl py-4 pl-14 pr-6 text-lg focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all placeholder-gray-500"
+            placeholder="Search for people, text, or organizations...">
+        <svg class="w-6 h-6 text-gray-500 absolute left-5 top-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+        </svg>
+    </div>
+
+    <!-- Results -->
+    <div id="results-area" class="space-y-4">
+        <!-- Results injected here -->
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const searchInput = document.getElementById('search-input');
+    const resultsArea = document.getElementById('results-area');
+    let debounceTimer;
+
+    searchInput.addEventListener('input', (e) => {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => performSearch(e.target.value), 300);
+    });
+
+    async function performSearch(query) {
+        if (!query || query.length < 2) {
+            resultsArea.innerHTML = '';
+            return;
+        }
+
+        try {
+            const res = await fetch(`/v1/search?name=${encodeURIComponent(query)}`);
+            const data = await res.json();
+            const results = data.results;
+
+            if (results.length === 0) {
+                resultsArea.innerHTML = '<div class="text-center text-gray-500 py-8">No matches found</div>';
+                return;
+            }
+
+            resultsArea.innerHTML = results.map(item => `
+                <div onclick="window.open('/files/' + '${item.video_path}'.split('/').pop() + '#t=${item.timestamp_seconds}', '_blank')" class="glass p-4 rounded-xl flex items-center space-x-4 hover:bg-gray-800 transition-colors cursor-pointer">
+                    <div class="w-12 h-12 bg-gray-700 rounded-full flex items-center justify-center text-xl font-bold text-gray-400">
+                        ${item.name ? item.name[0] : '?'}
+                    </div>
+                    <div class="flex-1">
+                        <h4 class="font-bold text-lg">${item.name}</h4>
+                        <div class="flex items-center space-x-4 text-sm text-gray-400">
+                            <span>${item.confidence ? Math.round(item.confidence) + '%' : 'Manual'} Match</span>
+                            <span>@ ${new Date(item.timestamp_seconds * 1000).toISOString().substr(11, 8)}</span>
+                        </div>
+                        <div class="text-xs text-gray-500 mt-1">${item.video_path.split('/').pop()}</div>
+                    </div>
+                    <svg class="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                </div>
+            `).join('');
+
+        } catch (e) {
+            console.error(e);
+        }
+    }
+</script>
+{% endblock %}

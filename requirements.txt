@@ -1,6 +1,14 @@
 # Core Dependencies
 flask==3.0.0
 werkzeug==3.0.1
+celery==5.3.6
+redis==5.0.1
+fastapi==0.109.0
+uvicorn==0.27.0
+python-multipart==0.0.6
+jinja2==3.1.2
+watchdog==3.0.0
+feedparser==6.0.10
 
 # Computer Vision & Face Recognition
 opencv-python==4.8.1.78
